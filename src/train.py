@@ -56,7 +56,7 @@
 # if __name__ == "__main__":
 #     raise SystemExit(main())
 
-# uv run src/train.py
+# python src/train.py
 
 import pickle
 from pathlib import Path
@@ -66,23 +66,21 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
-import torchvision.transforms as transforms
+from torchvision.transforms import v2 
 
 from load_fashion_mnist import load_train_data
 from network import NetworkConfig, FashionCNN
 
 OUTPUT_PATH = Path("sample_weight.pkl")
-EPOCHS = 35
-BATCH_SIZE = 128
+EPOCHS = 50
+BATCH_SIZE = 128 # 128に戻す
 LEARNING_RATE = 0.001
 SEED = 42
 
 def main() -> int:
-    # 1. デバイスの自動判定 (M1/M2 MacならMPS、NVIDIAならCUDA、それ以外はCPU)
     device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # 2. データの準備
     (x_train, t_train), (x_valid, t_valid) = load_train_data()
     
     x_train_t = torch.from_numpy(x_train).float().view(-1, 1, 28, 28)
@@ -90,11 +88,10 @@ def main() -> int:
     x_valid_t = torch.from_numpy(x_valid).float().view(-1, 1, 28, 28)
     t_valid_t = torch.from_numpy(t_valid).long()
 
-    # 3. データ拡張 (Data Augmentation)
-    # 左右反転と、わずかな回転を加えて擬似的にデータ量を増やす
-    train_transform = transforms.Compose([
-        transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomRotation(degrees=10),
+    # 【修正】強すぎた変形をやめ、画像認識の定石である「Padding & RandomCrop」を採用
+    train_transform = v2.Compose([
+        v2.RandomCrop(28, padding=2), # 外側に2ピクセル余白を作ってから28x28で切り出す
+        v2.RandomHorizontalFlip(p=0.5),
     ])
 
     train_dataset = TensorDataset(x_train_t, t_train_t)
@@ -103,17 +100,16 @@ def main() -> int:
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
     valid_loader = DataLoader(valid_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
-    # 4. モデルと最適化アルゴリズムのセットアップ
     config = NetworkConfig(batch_size=BATCH_SIZE, learning_rate=LEARNING_RATE, seed=SEED)
     model = FashionCNN(config).to(device)
     
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
-    
-    # 25エポック目で学習率を1/10にする
-    scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[25], gamma=0.1)
+    # Label Smoothingを0.1から0.05へ緩和
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-3)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
 
-    # 5. 学習ループ
+    best_valid_acc = 0.0
+
     for epoch in range(1, EPOCHS + 1):
         model.train()
         total_loss = 0.0
@@ -121,9 +117,10 @@ def main() -> int:
         total_train = 0
         
         for batch_x, batch_t in train_loader:
-            # データ拡張の適用
-            batch_x = torch.stack([train_transform(img) for img in batch_x])
             batch_x, batch_t = batch_x.to(device), batch_t.to(device)
+            
+            # v2を使ってバッチ単位で一括処理
+            batch_x = train_transform(batch_x)
             
             optimizer.zero_grad()
             logits = model(batch_x)
@@ -136,9 +133,9 @@ def main() -> int:
             correct_train += (preds == batch_t).sum().item()
             total_train += batch_t.size(0)
             
+        current_lr = scheduler.get_last_lr()[0]
         scheduler.step()
         
-        # 検証ループ
         model.eval()
         correct_valid = 0
         total_valid = 0
@@ -154,16 +151,16 @@ def main() -> int:
         train_acc = correct_train / total_train
         valid_acc = correct_valid / total_valid
         
-        current_lr = scheduler.get_last_lr()[0]
         print(f"Epoch {epoch:02d}/{EPOCHS} [LR: {current_lr:.5f}] loss={epoch_loss:.4f} train_acc={train_acc:.4f} valid_acc={valid_acc:.4f}")
 
-    # 6. モデルの保存
-    with OUTPUT_PATH.open("wb") as f:
-        pickle.dump(model.to_state(), f)
+        if valid_acc > best_valid_acc:
+            best_valid_acc = valid_acc
+            with OUTPUT_PATH.open("wb") as f:
+                pickle.dump(model.to_state(), f)
+            print(f"  -> Best model saved! (Valid Acc: {best_valid_acc:.4f})")
 
-    print(f"Saved model: {OUTPUT_PATH.resolve()}")
+    print(f"Training finished! Best validation accuracy: {best_valid_acc:.4f}")
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

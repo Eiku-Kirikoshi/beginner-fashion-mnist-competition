@@ -212,7 +212,6 @@
 #         model = cls(config)
 #         model.params = params
 #         return model
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -229,62 +228,62 @@ class NetworkConfig:
     input_size: int = 784
     output_size: int = 10
     learning_rate: float = 0.001
-    batch_size: int = 128
+    batch_size: int = 128 # 128に戻して更新回数を増やす
     seed: int = 42
 
-
 class FashionCNN(nn.Module):
-    """画像の特徴を2次元のまま捉えるCNNアーキテクチャ"""
+    """画像の解像度を保ちながら特徴を抽出するVGGライクなCNN"""
     def __init__(self, config: NetworkConfig) -> None:
         super().__init__()
         self.config = config
-        
-        # 乱数シードの固定（再現性確保のため）
         torch.manual_seed(config.seed)
         
-        # 畳み込み層1: 画像の細かいエッジ（輪郭）を抽出
-        self.conv1 = nn.Conv2d(in_channels=1, out_channels=32, kernel_size=3, padding=1)
+        # Block 1 (解像度 28 -> 14 へ)
+        self.conv1 = nn.Conv2d(1, 32, kernel_size=3, padding=1)
         self.bn1 = nn.BatchNorm2d(32)
-        
-        # 畳み込み層2: エッジを組み合わせてパーツ（袖や襟など）を抽出
-        self.conv2 = nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
         self.bn2 = nn.BatchNorm2d(64)
+        self.pool1 = nn.MaxPool2d(2, 2)
+        self.drop1 = nn.Dropout2d(0.2)
         
-        # 畳み込み層3: 全体のシルエットを抽出
-        self.conv3 = nn.Conv2d(in_channels=64, out_channels=128, kernel_size=3, padding=1)
+        # Block 2 (解像度 14 -> 7 へ。ここで止めて細かい情報を残す)
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
         self.bn3 = nn.BatchNorm2d(128)
+        self.conv4 = nn.Conv2d(128, 128, kernel_size=3, padding=1)
+        self.bn4 = nn.BatchNorm2d(128)
+        self.pool2 = nn.MaxPool2d(2, 2)
+        self.drop2 = nn.Dropout2d(0.2)
         
-        # プーリング層: 情報を圧縮し、位置のズレに強くする
-        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
-        
-        # ドロップアウト層: 過学習を強力に防ぐ
-        self.dropout = nn.Dropout(0.3)
-        
-        # 全結合層: 抽出した特徴から10種類のクラスに分類
-        # 28x28の画像が3回のプーリングで 3x3 に縮小されるため、128 * 3 * 3 = 1152次元
-        self.fc1 = nn.Linear(128 * 3 * 3, 256)
-        self.fc2 = nn.Linear(256, config.output_size)
+        # 全結合層 (128チャンネル * 7 * 7 = 6272次元)
+        self.fc1 = nn.Linear(128 * 7 * 7, 512)
+        self.drop3 = nn.Dropout(0.3) # 負荷を少し緩和
+        self.fc2 = nn.Linear(512, config.output_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 1次元 (784) で入力された場合、2次元画像 (1チャンネル, 28x28) に変換
         if x.dim() == 2:
             x = x.view(-1, 1, 28, 28)
             
-        x = self.pool(F.relu(self.bn1(self.conv1(x))))
-        x = self.pool(F.relu(self.bn2(self.conv2(x))))
-        x = self.pool(F.relu(self.bn3(self.conv3(x))))
+        # Block 1
+        x = F.gelu(self.bn1(self.conv1(x)))
+        x = F.gelu(self.bn2(self.conv2(x)))
+        x = self.pool1(x)
+        x = self.drop1(x)
         
-        x = x.view(x.size(0), -1)  # 1列に平坦化
-        x = self.dropout(x)
+        # Block 2
+        x = F.gelu(self.bn3(self.conv3(x)))
+        x = F.gelu(self.bn4(self.conv4(x)))
+        x = self.pool2(x)
+        x = self.drop2(x)
         
-        x = F.relu(self.fc1(x))
-        x = self.dropout(x)
+        x = x.view(x.size(0), -1)
+        
+        x = F.gelu(self.fc1(x))
+        x = self.drop3(x)
         logits = self.fc2(x)
         return logits
 
     def predict(self, x_numpy: np.ndarray) -> np.ndarray:
-        """submit.py 用の推論メソッド（NumPyを受け取りNumPyを返す）"""
-        self.eval()  # 推論時はDropoutやBatchNormを評価モードにする
+        self.eval()
         with torch.no_grad():
             x_tensor = torch.from_numpy(x_numpy).float()
             logits = self.forward(x_tensor)
@@ -292,8 +291,6 @@ class FashionCNN(nn.Module):
         return preds.cpu().numpy()
 
     def to_state(self) -> dict[str, Any]:
-        """モデルの状態と設定を保存"""
-        # 保存前にCPUメモリに移動させることで、別のPCでも読み込めるようにする
         self.cpu()
         return {
             "model_type": "FashionCNN",
@@ -303,11 +300,9 @@ class FashionCNN(nn.Module):
 
     @classmethod
     def from_state(cls, state: dict[str, Any]) -> FashionCNN:
-        """保存された状態からモデルを復元"""
         config = state["config"]
         model = cls(config)
         model.load_state_dict(state["model_state_dict"])
         return model
 
-# 既存の submit.py から読み込めるように、クラス名を SimpleMLP としてエイリアス（別名）を作っておく
 SimpleMLP = FashionCNN
